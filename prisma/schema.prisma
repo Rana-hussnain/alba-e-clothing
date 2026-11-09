@@ -1,0 +1,166 @@
+// Prisma schema — e-commerce storefront (Kids & Men collection)
+// Database: MongoDB Atlas (set DATABASE_URL in .env)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  slug        String   @unique
+  name        String
+  category    String // "kids" | "men"
+  subtype     String // e.g. "T-Shirts", "Baggy Jeans"
+  description String
+  price       Int // PKR
+  image       String
+  sizes       String // JSON array string
+  colors      String // JSON array string
+  featured    Boolean  @default(false)
+  stock       Int? // pieces available; empty = not tracked (always in stock)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Order {
+  id                  String    @id @default(auto()) @map("_id") @db.ObjectId
+  orderNumber         String    @unique
+  firstName           String
+  lastName            String
+  address             String
+  city                String
+  contactNumber       String
+  postalCode          String
+  email               String?
+  itemsJson           String    // JSON array of ordered items
+  subtotal            Int       // PKR
+  shippingCharges     Int       @default(300) // PKR 300 flat
+  totalPayable        Int       // subtotal + shipping — paid in FULL before delivery
+  status              String    @default("PENDING_PAYMENT") // PENDING_PAYMENT → CONFIRMED → SHIPPED → DELIVERED | CANCELLED
+  paymentMethod       String    @default("JAZZCASH") // JazzCash full payment
+  paymentStatus       String    @default("PENDING") // PENDING → VERIFYING (TID submitted) → PAID | REJECTED
+  senderNumber        String?   // JazzCash number the customer paid from
+  paidAt              DateTime?
+  txnRef              String?   // customer TID or JazzCash transaction reference
+  customerId          String?   @db.ObjectId // the signed-in customer who placed the order
+  courier             String? // e.g. TCS, Leopards — set when the owner ships the order
+  trackingNumber      String? // courier tracking / consignment number
+  createdAt           DateTime  @default(now())
+
+  @@index([customerId])
+}
+
+// Customer accounts — only signed-in customers can place orders
+model Customer {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  name            String
+  email           String    @unique // always stored lower-case
+  phone           String
+  passwordHash    String // scrypt — never the plain password
+  emailVerified   Boolean   @default(false)
+  verifyTokenHash String? // sha256 of the emailed link token (the token itself is never stored)
+  verifyExpires   DateTime?
+  resetTokenHash  String?
+  resetExpires    DateTime?
+  createdAt       DateTime  @default(now())
+  lastLoginAt     DateTime?
+}
+
+// Every JazzCash transaction ID may be used for ONE order only (blocks reusing a TID / fake orders)
+model PaymentTxn {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  txn         String   @unique
+  orderNumber String
+  createdAt   DateTime @default(now())
+}
+
+// Real customer reviews — only buyers with a DELIVERED order can write one, and the owner approves it before it shows
+model Review {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  productId  String   @db.ObjectId
+  customerId String   @db.ObjectId
+  orderNumber String
+  name       String // shown publicly, e.g. "Ahmed K."
+  city       String
+  rating     Int // 1–5
+  comment    String
+  status     String   @default("PENDING") // PENDING | APPROVED | REJECTED
+  createdAt  DateTime @default(now())
+  decidedAt  DateTime?
+
+  @@unique([productId, customerId]) // one review per buyer per product
+  @@index([status, createdAt])
+}
+
+// Append-only audit trail (logins, orders, payment checks, admin actions) — shown in /admin → Audit log
+model AuditLog {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  seq       Int      @unique // running number 1, 2, 3 … (no gaps allowed)
+  createdAt DateTime @default(now())
+  actor     String // "admin" | "customer:<email>" | "system"
+  action    String // e.g. "customer.login", "admin.payment.verify"
+  target    String? // order number, product id, email ...
+  ip        String?
+  detail    String?
+  prevHash  String // hash of the entry before this one ("GENESIS" for the first)
+  hash      String // HMAC of this entry + prevHash — see src/lib/audit.ts
+  keyId     String // fingerprint of the signing key that produced `hash`
+
+  @@index([createdAt])
+  @@index([action])
+  @@map("AuditEntry") // a fresh collection for the tamper-evident format (older, unsigned lines are left untouched)
+}
+
+// Failed customer-login counters (per IP and per account) — drives the lockout
+model CustomerLoginAttempt {
+  id            String    @id @default(auto()) @map("_id") @db.ObjectId
+  key           String    @unique // "cip:<address>" | "cemail:<email>"
+  failures      Int       @default(0)
+  lockedUntil   DateTime?
+  lastFailureAt DateTime
+}
+
+// Generic fixed-window rate limiter (register, password reset, orders ...)
+model RateLimit {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  key         String   @unique
+  count       Int      @default(0)
+  windowStart DateTime
+}
+
+// Failed admin-login counters (per IP and for the admin account) — drives the lockout
+model AdminLoginAttempt {
+  id            String    @id @default(auto()) @map("_id") @db.ObjectId
+  key           String    @unique // "ip:<address>" | "account"
+  failures      Int       @default(0)
+  lockedUntil   DateTime?
+  lastFailureAt DateTime
+}
+
+// Product images uploaded from the admin panel (stored in the DB so they survive redeploys / read-only hosting)
+model UploadedImage {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  mime      String
+  size      Int
+  data      Bytes
+  createdAt DateTime @default(now())
+}
+
+model EmailLog {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  orderNumber String
+  kind        String // "CUSTOMER_CONFIRMATION" | "OWNER_NOTIFICATION"
+  to          String // recipient (may be "(not provided)" for customer without email)
+  subject     String
+  bodyHtml    String
+  status      String   @default("QUEUED") // "SENT" | "QUEUED" | "FAILED" | "SKIPPED"
+  error       String?
+  createdAt   DateTime @default(now())
+
+  @@index([orderNumber])
+}
